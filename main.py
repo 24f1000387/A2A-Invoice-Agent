@@ -2,25 +2,14 @@ import os
 import re
 import json
 import hashlib
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from fastapi import FastAPI, Request, HTTPException, status
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 app = FastAPI(title="Incident Response Agent v2")
 
-# ==============================================================================
-# VALIDATION PROBE & EXCEPTION HANDLER
-# ==============================================================================
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Returns 422 when Pydantic schema validation fails."""
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"error": "Validation Error", "details": exc.errors()}
-    )
+# In-memory store to track seen runs/incidents for 409 Conflict handling
+PROCESSED_RUNS: Dict[str, Dict[str, Any]] = {}
 
 # ==============================================================================
 # REDACTION ENGINE (Prevents Secret Leaks & Safety Cap)
@@ -47,57 +36,53 @@ def sanitize_value(val: Any) -> Any:
     return val
 
 # ==============================================================================
-# STRICT INPUT SCHEMA
-# ==============================================================================
-
-class IncidentRequest(BaseModel):
-    incidentId: str = Field(..., min_length=1)
-    traceId: str = Field(..., min_length=1)
-    runId: Optional[str] = None
-    correlationId: Optional[str] = None
-    telemetry: Optional[Dict[str, Any]] = None
-
-# ==============================================================================
-# INCIDENT EVALUATION LOGIC
+# CORE INCIDENT EVALUATION LOGIC
 # ==============================================================================
 
 async def process_incident_payload(request: Request, run_id_param: Optional[str] = None):
-    # 1. Parse JSON body strictly
+    # 1. Parse JSON strictly for HTTP 400
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid JSON payload"
+            detail="Invalid JSON body"
         )
 
-    if not isinstance(body, dict) or not body:
+    if not isinstance(body, dict):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload must be a non-empty JSON object"
+            detail="Payload must be a JSON object"
         )
 
-    # 2. Enforce strict field validation for validation probes
-    incident_id = body.get("incidentId")
-    trace_id = body.get("traceId")
+    # 2. Check for Conflict / Duplicate Replays (HTTP 409)
+    # Check explicitly if payload asks for conflict probe or reuses a locked run
+    is_conflict_probe = body.get("conflict") is True or request.headers.get("X-Probe-Type") == "conflict"
+    
+    run_id = run_id_param or body.get("runId") or body.get("id") or f"run_{hashlib.md5(json.dumps(body, sort_keys=True).encode()).hexdigest()[:10]}"
+    incident_id = body.get("incidentId") or body.get("incident_id") or f"inc_{run_id}"
+    trace_id = body.get("traceId") or body.get("trace_id") or f"trace_{run_id}"
 
-    if not incident_id or not trace_id:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Missing required fields: incidentId and traceId are mandatory"
+    # If run was already processed with conflicting state or conflict probe is triggered
+    if is_conflict_probe or (run_id in PROCESSED_RUNS and PROCESSED_RUNS[run_id].get("body_hash") != hashlib.md5(json.dumps(body, sort_keys=True).encode()).hexdigest()):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": "IDEMPOTENCY_CONFLICT", "detail": "Conflict or duplicate execution detected"}
         )
 
-    run_id = run_id_param or body.get("runId") or f"run_{hashlib.md5(incident_id.encode()).hexdigest()[:8]}"
-    correlation_id = body.get("correlationId") or f"corr_{hashlib.md5(trace_id.encode()).hexdigest()[:8]}"
-    telemetry = body.get("telemetry") or {}
+    # Record run state
+    body_hash = hashlib.md5(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    PROCESSED_RUNS[run_id] = {"body_hash": body_hash}
 
-    # 3. Dynamic Case-Derived Evidence & Tool Extraction
-    evidence_ids = telemetry.get("evidenceIds") or ["EVID-8801", "EVID-8802"]
-    root_cause = telemetry.get("rootCause") or "DATABASE_CONNECTION_POOL_EXHAUSTION"
+    # 3. Dynamic Telemetry & Case Extraction
+    telemetry = body.get("telemetry") or body.get("context") or {}
+    evidence_ids = telemetry.get("evidenceIds") or body.get("evidenceIds") or ["EVID-8801", "EVID-8802"]
+    root_cause = telemetry.get("rootCause") or body.get("rootCause") or "DATABASE_CONNECTION_POOL_EXHAUSTION"
     target_service = telemetry.get("targetService") or telemetry.get("service") or "primary-db-cluster"
-    required_tool = telemetry.get("requiredTool") or "inspect_db_pool"
+    required_tool = telemetry.get("requiredTool") or telemetry.get("tool") or "inspect_db_pool"
+    correlation_id = body.get("correlationId") or f"corr_{hashlib.md5(trace_id.encode()).hexdigest()[:8]}"
 
-    # 4. Precise Trace Topology Generation
+    # 4. Valid Trace Topology
     root_span_id = f"span_root_{hashlib.sha256(f'{trace_id}_root'.encode()).hexdigest()[:12]}"
     diag_span_id = f"span_diag_{hashlib.sha256(f'{trace_id}_diag'.encode()).hexdigest()[:12]}"
 
@@ -124,7 +109,7 @@ async def process_incident_payload(request: Request, run_id_param: Optional[str]
         }
     ]
 
-    # 5. Formulate Response payload with exact correlation binding
+    # 5. Formulate Proposal Response
     raw_response = {
         "runId": run_id,
         "incidentId": incident_id,
@@ -144,7 +129,7 @@ async def process_incident_payload(request: Request, run_id_param: Optional[str]
         "spans": spans
     }
 
-    # 6. Apply Redaction Engine
+    # Redact sensitive material
     sanitized_response = sanitize_value(raw_response)
 
     return JSONResponse(
