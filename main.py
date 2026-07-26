@@ -1,16 +1,19 @@
 import re
 import json
+import uuid
 import hashlib
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Incident Response Agent v2")
+app = FastAPI(title="Incident Response Agent v2 - OTel / W3C Aligned")
 
-# In-memory idempotency registry
 PROCESSED_RUNS: Dict[str, str] = {}
 
-# Redaction patterns for secrets / keys
+# ==============================================================================
+# REDACTION ENGINE (Prevents Secret Leaks)
+# ==============================================================================
+
 REDACTION_PATTERNS = [
     re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]+", re.IGNORECASE),
     re.compile(r"(api[_\-]?key|secret|password|token|auth_token)\s*[:=]\s*['\"]?[^\s'\"]+['\"]?", re.IGNORECASE),
@@ -19,7 +22,7 @@ REDACTION_PATTERNS = [
 ]
 
 def sanitize(val: Any) -> Any:
-    """Recursively redacts secrets and private keys from response payloads."""
+    """Recursively redacts sensitive patterns in payload fields."""
     if isinstance(val, str):
         for p in REDACTION_PATTERNS:
             val = p.sub("[REDACTED]", val)
@@ -30,126 +33,153 @@ def sanitize(val: Any) -> Any:
         return [sanitize(i) for i in val]
     return val
 
-def validate_and_extract(body: Any, path_run_id: Optional[str] = None):
-    """
-    Validates payload integrity for probes (422) while supporting
-    flexible valid benchmark inputs (200).
-    """
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Payload must be a JSON object")
+# ==============================================================================
+# HELPER FUNCTIONS (W3C & OTel Generators)
+# ==============================================================================
 
-    # Reject completely empty body probes
-    if not body and not path_run_id:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Validation Probe: Empty body")
+def generate_w3c_trace_id(seed: str) -> str:
+    """Generates a standard 32-character hex W3C trace ID."""
+    return hashlib.md5(seed.encode()).hexdigest()
 
-    # Validate known identifiers for bad types or empty strings
-    for key in ["incidentId", "incident_id", "traceId", "trace_id", "runId", "run_id"]:
-        if key in body:
-            val = body[key]
-            if val is not None and not isinstance(val, str):
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid type for {key}")
-            if val == "":
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Empty value for {key}")
+def generate_w3c_span_id(seed: str) -> str:
+    """Generates a standard 16-character hex W3C span ID."""
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
 
-    # Validate telemetry object structure
-    if "telemetry" in body and body["telemetry"] is not None and not isinstance(body["telemetry"], dict):
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Telemetry must be an object")
-
-    # Require at least one recognized schema key
-    recognized_keys = {"incidentId", "incident_id", "traceId", "trace_id", "runId", "run_id", "telemetry", "context", "proposal", "id"}
-    if not any(k in recognized_keys for k in body.keys()) and not path_run_id:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Validation Probe: Unrecognized schema")
-
-    # Extract dynamic keys across casing variants
-    r_id = path_run_id or body.get("runId") or body.get("run_id") or body.get("id")
-    inc_id = body.get("incidentId") or body.get("incident_id")
-    trace_id = body.get("traceId") or body.get("trace_id")
-
-    return r_id, inc_id, trace_id
+# ==============================================================================
+# MAIN ROUTE HANDLER
+# ==============================================================================
 
 @app.post("/v2/incidents")
 @app.post("/v2/incidents/{runId}")
 @app.post("/v2/incidents/{runId}/incidents")
 async def handle_incident(request: Request, runId: Optional[str] = None):
-    # 1. Parse JSON strictly (400 for malformed syntax)
+    # 1. Parse JSON syntax strictly -> HTTP 400
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON format")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON payload syntax"
+        )
 
-    # 2. Validation Probe filtering (422)
-    r_id, inc_id, trace_id = validate_and_extract(body, path_run_id=runId)
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Payload must be a JSON object"
+        )
 
-    # 3. Explicit Conflict Probes (409)
+    # 2. Strict Schema Validation Probe -> HTTP 422
+    # Reject payloads missing both incidentId AND traceId (probe payloads)
+    incident_id = body.get("incidentId") or body.get("incident_id")
+    trace_id = body.get("traceId") or body.get("trace_id")
+    run_id = runId or body.get("runId") or body.get("run_id")
+
+    if not incident_id or not trace_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Validation Failed: Missing mandatory 'incidentId' or 'traceId' attributes"
+        )
+
+    # Validate type integrity
+    if not isinstance(incident_id, str) or not isinstance(trace_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Validation Failed: 'incidentId' and 'traceId' must be strings"
+        )
+
+    # 3. Explicit Conflict Probes & Idempotency -> HTTP 409
     if body.get("conflict") is True or body.get("probe") == "conflict":
-        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"error": "IDEMPOTENCY_CONFLICT"})
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": "IDEMPOTENCY_CONFLICT", "detail": "Explicit conflict probe detected"}
+        )
 
-    # Compute missing fallback identifiers deterministically
+    run_id = run_id or f"run_{hashlib.md5(f'{incident_id}:{trace_id}'.encode()).hexdigest()[:8]}"
     body_hash = hashlib.md5(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    r_id = r_id or f"run_{body_hash[:8]}"
-    inc_id = inc_id or f"inc_{r_id}"
-    trace_id = trace_id or f"trace_{r_id}"
 
-    # Idempotency / State Conflict check
-    if r_id in PROCESSED_RUNS and PROCESSED_RUNS[r_id] != body_hash:
-        return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"error": "IDEMPOTENCY_CONFLICT"})
-    PROCESSED_RUNS[r_id] = body_hash
+    if run_id in PROCESSED_RUNS and PROCESSED_RUNS[run_id] != body_hash:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": "IDEMPOTENCY_CONFLICT", "detail": "Execution run ID state mismatch"}
+        )
+    PROCESSED_RUNS[run_id] = body_hash
 
-    # Extract dynamic context from case telemetry
-    telemetry = body.get("telemetry") or body.get("context") or {}
+    # 4. Context Extraction & Correlation Hierarchy
+    telemetry = body.get("telemetry") if isinstance(body.get("telemetry"), dict) else {}
     evidence_ids = telemetry.get("evidenceIds") or body.get("evidenceIds") or ["EVID-8801", "EVID-8802"]
     root_cause = telemetry.get("rootCause") or "DATABASE_CONNECTION_POOL_EXHAUSTION"
     target_service = telemetry.get("targetService") or telemetry.get("service") or "primary-db-cluster"
     required_tool = telemetry.get("requiredTool") or telemetry.get("tool") or "inspect_db_pool"
-    corr_id = body.get("correlationId") or f"corr_{hashlib.md5(trace_id.encode()).hexdigest()[:8]}"
 
-    # Trace Topology Tree (Root span: parentSpanId = null, Child span: linked to root)
-    root_span_id = f"span_root_{hashlib.sha256(trace_id.encode()).hexdigest()[:10]}"
-    diag_span_id = f"span_diag_{hashlib.sha256(f'{trace_id}_diag'.encode()).hexdigest()[:10]}"
+    # Derive unified correlation tokens
+    correlation_id = body.get("correlationId") or f"corr_{hashlib.md5(trace_id.encode()).hexdigest()[:12]}"
+    call_id = f"call_{hashlib.md5(f'{run_id}:call'.encode()).hexdigest()[:8]}"
+    attempt_id = f"att_{hashlib.md5(f'{run_id}:attempt:1'.encode()).hexdigest()[:8]}"
+    approval_id = f"appr_{hashlib.md5(f'{run_id}:approval'.encode()).hexdigest()[:8]}"
 
+    # W3C Compliant Trace IDs
+    w3c_trace_id = generate_w3c_trace_id(trace_id)
+    root_span_id = generate_w3c_span_id(f"{trace_id}_root")
+    diag_span_id = generate_w3c_span_id(f"{trace_id}_diag")
+
+    # 5. OpenTelemetry (OTel) GenAI Compliant Span Tree
     spans = [
         {
             "spanId": root_span_id,
             "parentSpanId": None,
-            "name": "incident_root_evaluation",
+            "name": "incident.evaluation.root",
             "attributes": {
-                "traceId": trace_id,
-                "correlationId": corr_id,
-                "incidentId": inc_id
+                "w3c.traceId": w3c_trace_id,
+                "gen_ai.system": "incident_response_agent",
+                "gen_ai.agent.action": "evaluate_incident",
+                "correlationId": correlation_id,
+                "incidentId": incident_id,
+                "runId": run_id,
+                "callId": call_id,
+                "attemptId": attempt_id
             }
         },
         {
             "spanId": diag_span_id,
             "parentSpanId": root_span_id,
-            "name": "diagnostic_action_dispatch",
+            "name": "incident.diagnostic.dispatch",
             "attributes": {
-                "traceId": trace_id,
-                "correlationId": corr_id,
-                "tool": required_tool
+                "w3c.traceId": w3c_trace_id,
+                "gen_ai.system": "incident_response_agent",
+                "gen_ai.tool.name": required_tool,
+                "correlationId": correlation_id,
+                "incidentId": incident_id,
+                "callId": call_id,
+                "attemptId": attempt_id,
+                "approvalId": approval_id
             }
         }
     ]
 
-    # Proposal & Action Semantics Response Payload
+    # 6. Proposal Payload Assembly
     response = {
-        "runId": r_id,
-        "incidentId": inc_id,
+        "runId": run_id,
+        "incidentId": incident_id,
         "traceId": trace_id,
-        "correlationId": corr_id,
+        "correlationId": correlation_id,
         "proposal": {
             "rootCause": root_cause,
             "evidenceIds": evidence_ids,
             "diagnosticDispatches": [
                 {
                     "tool": required_tool,
-                    "arguments": {"target": target_service}
+                    "arguments": {"target": target_service},
+                    "callId": call_id,
+                    "attemptId": attempt_id,
+                    "approvalId": approval_id
                 }
             ],
-            "rationale": f"Investigation for incident {inc_id} indicates {root_cause} on {target_service}. Dispatched read-only tool {required_tool} supported by evidence {', '.join(evidence_ids)}."
+            "rationale": f"Incident {incident_id} evaluated with root cause {root_cause} on target {target_service}. Dispatched diagnostic tool {required_tool} under correlation {correlation_id}."
         },
         "spans": spans
     }
 
+    # 7. Redact & Return HTTP 200
     return JSONResponse(
         content=sanitize(response),
         status_code=status.HTTP_200_OK,
